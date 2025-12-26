@@ -2,16 +2,12 @@ from mock_api import MockAPI
 from bedrock_service import BedrockService
 import datetime
 import json
+import re
 
-# States
-STATE_INIT = "INIT"
-STATE_PO_TYPE = "PO_TYPE"
-STATE_SUPPLIER = "SUPPLIER"
-STATE_SUPPLIER_DETAILS = "SUPPLIER_DETAILS"
-STATE_ORG_DETAILS = "ORG_DETAILS"
-STATE_COMMERCIALS = "COMMERCIALS"
-STATE_LINE_ITEMS_START = "LINE_ITEMS_START"
-STATE_LINE_ITEM_DETAILS = "LINE_ITEM_DETAILS"
+# Conversational States
+STATE_GREETING = "GREETING"
+STATE_PO_INTENT = "PO_INTENT"
+STATE_COLLECTING = "COLLECTING"
 STATE_CONFIRM = "CONFIRM"
 STATE_DONE = "DONE"
 
@@ -22,7 +18,7 @@ class POAgent:
         
     def get_initial_state(self):
         return {
-            "current_step": STATE_PO_TYPE,
+            "current_step": STATE_GREETING,
             "payload": {
                 "line_items": [],
                 "projects": [{"project_code": "", "project_name": ""}],
@@ -40,408 +36,665 @@ class POAgent:
                 "noc": "No",
                 "datasupplier": ""
             },
-            "history": [],
-            "temp_data": {}
+            "conversation_history": [],
+            "missing_fields": [],
+            "last_question": None,
+            "extracted_entities": {},
+            "temp_line_item": {}
         }
+
+    def identify_missing_fields(self, payload, state=None):
+        """Identify which mandatory fields are still missing"""
+        missing = []
+        
+        # Check dates
+        if not payload.get("po_date"):
+            missing.append("po_date")
+        if not payload.get("validityEnd"):
+            missing.append("validityEnd")
+        if not payload.get("currency"):
+            missing.append("currency")
+            
+        # Check organization
+        if not payload.get("purchase_org_id"):
+            missing.append("purchase_org_id")
+        if not payload.get("plant_id"):
+            missing.append("plant_id")
+        if not payload.get("purchase_grp_id"):
+            missing.append("purchase_grp_id")
+            
+        # Check commercials (optional but ask)
+        # Check commercials (optional but ask) MOVED to optional logic below
+        # if not payload.get("payment_terms"):
+        #     missing.append("payment_terms")
+        # if not payload.get("inco_terms"):
+        #     missing.append("inco_terms")
+            
+        # Check line items
+        # If we have a temp line item, we are "working on it", so don't flag "line_items" as missing yet
+        # Instead, check if that temp item has what it needs
+        if state and state.get("temp_line_item"):
+            item = state["temp_line_item"]
+            if not item.get("delivery_date"):
+                missing.append("delivery_date")
+            elif not item.get("tax_code"):
+                missing.append("tax_code")
+        
+        # Only flag "line_items" if we have NO items and NO temp item
+        elif not payload.get("line_items") or len(payload["line_items"]) == 0:
+            missing.append("line_items")
+            
+        # Optional Fields Logic
+        # If core fields (dates, orgs, line items) are done, ask about optional fields
+        if not missing and state and not state.get("optional_asked"):
+            return ["optional_prompt"]
+            
+        # If user agreed to fill optional fields, check them
+        if state and state.get("fill_optional"):
+            if not payload.get("payment_terms"):
+                missing.append("payment_terms")
+            if not payload.get("inco_terms"):
+                missing.append("inco_terms")
+            # Projects is optional-optional but let's ask if they wanted optional fields
+            if not payload.get("projects") or (len(payload["projects"]) > 0 and not payload["projects"][0]["project_code"]):
+                 missing.append("projects")
+        
+        return missing
+
+    def ask_next_question(self, state):
+        """Generate next question based on missing fields"""
+        missing = self.identify_missing_fields(state["payload"], state)
+        
+        if not missing:
+            return None
+            
+        field = missing[0]
+        
+        questions = {
+            "po_date": "What is the PO date? (Format: YYYY-MM-DD)",
+            "validityEnd": "What is the validity end date? (Format: YYYY-MM-DD)",
+            "purchase_org_id": "What is the Purchase Organization? (Type name or ID)",
+            "plant_id": "What is the Plant? (Type name or ID)",
+            "purchase_grp_id": "What is the Purchase Group? (Type name or ID)",
+            "payment_terms": "What are the payment terms? (Type 'show options' to see list, or 'default')",
+            "inco_terms": "What are the incoterms? (Type 'show options' to see list, or 'default')",
+            "delivery_date": "What is the delivery date for the line item? (Format: YYYY-MM-DD)",
+            "tax_code": "What is the tax code? (Type 'show options' to see list, or ID)",
+            "currency": "What is the currency? (e.g., INR, USD)",
+            "optional_prompt": "Do you want to fill these optional fields: **Payment Terms**, **Incoterms**, **Projects**? (Type **yes** or **no**)",
+            "projects": "What is the Project Code? (Type 'show options' to see list, or code)"
+        }
+        
+        question = questions.get(field, f"Please provide: {field}")
+        state["last_question"] = question
+        state["missing_fields"] = missing
+        
+        return question
+
+    def format_options(self, items, id_key="id", name_key="name", limit=10):
+        """Format list of options for display"""
+        if not items:
+            return "No options available."
+            
+        lines = ["Found options:"]
+        for item in items[:limit]:
+            item_id = item.get(id_key, "")
+            item_name = item.get(name_key, "")
+            lines.append(f"**{item_id}** – {item_name}")
+            
+        if len(items) > limit:
+            lines.append(f"\n_(Showing {limit} of {len(items)} results)_")
+            
+        lines.append("\nType the ID to select.")
+        return "\n".join(lines)
 
     def process_input(self, user_text, state):
         current_step = state["current_step"]
         payload = state["payload"]
         response_text = ""
         
-        # 1. NLU Analysis
-        nlu_result = self.nlu.analyze_intent(user_text, current_step)
-        entities = nlu_result.get("entities", {})
+        # Add to conversation history
+        state["conversation_history"].append({"role": "user", "content": user_text})
         
-        # 2. State Machine Logic
+        # ===== STATE: GREETING =====
+        if current_step == STATE_GREETING:
+            lower_text = user_text.lower().strip()
+            
+            # Handle number selection or text
+            if lower_text in ["1", "independent", "independent po"] or "independ" in lower_text:
+                payload["is_pr_based"] = False
+                payload["is_rfq_based"] = False
+                state["current_step"] = STATE_PO_INTENT
+                response_text = "Great! What PO do you want to create?\n\n_Example: \"create a po for 2 scooty of regular purchase from supplier Smartsaa, each of 123 rupees\"_"
+                
+            elif lower_text in ["2", "pr", "pr-based", "pr based"] or ("pr" in lower_text and "based" in lower_text):
+                response_text = "PR-based PO flow is coming soon. Please select **Independent PO** for now."
+                
+            elif lower_text in ["3", "rfq", "rfq-based", "rfq based"]:
+                response_text = "RFQ-based PO flow is coming soon. Please select **Independent PO** for now."
+                
+            else:
+                response_text = "Please select one of:\n1. **Independent PO**\n2. PR-based PO _(coming soon)_\n3. RFQ-based PO _(coming soon)_"
         
-        # GLOBAL OVERRIDE: If User clicks "Create PO" button
-        if "create po" in user_text.lower() or "create purchase order" in user_text.lower():
-             print(f"DEBUG: Create PO triggered. Line items count: {len(payload.get('line_items', []))}")
-             
-             if payload.get("line_items"):
-                 # Trigger Create
-                 # 1. Final Payload Polish
-                 payload["total"] = sum(float(x.get("total_value", x.get("sub_total", 0))) for x in payload["line_items"])
-                 
-                 print(f"DEBUG: Calculated total: {payload['total']}")
-                 
-                 # 2. Transform payload for API
-                 api_payload = payload.copy()
-                 # DO NOT Rename to lineItems - User confirmed line_items is expected
-                 # api_payload["lineItems"] = api_payload.pop("line_items") 
-                 
-                 # REMOVE EXTRA FIELDS removed - User requests all fields be sent even if empty
-                 # keys_to_remove = [
-                 #     "alternate_supplier_name", 
-                 #     "alternate_supplier_email", 
-                 #     "alternate_supplier_contact_number",
-                 #     "inco_terms_description",
-                 #     "payment_terms_description"
-                 # ]
-                 # for k in keys_to_remove:
-                 #     api_payload.pop(k, None)
-                     
-                 # Clean Line Items
-                 if "line_items" in api_payload:
-                     for item in api_payload["line_items"]:
-                         item.pop("short_desc", None)
-                         # Force subServices to empty string as per user "Correct" JSON
-                         item["subServices"] = ""
-                         # Force control_code to empty string as per user "Correct" JSON
-                         item["control_code"] = ""
-                         
-                         # Ensure all line item fields from user example are present
-                         if "short_desc" not in item: item["short_desc"] = item.get("short_text", "")
-                 
-                 print(f"DEBUG: Sending payload keys: {list(api_payload.keys())}")
-                 print(f"DEBUG: Line Items: {json.dumps(api_payload.get('line_items', []), indent=2)}")
-                 
-                 # 3. API Call
-                 api_resp = self.api.create_po(api_payload)
-                 
-                 print(f"DEBUG: API Response keys: {api_resp.keys() if isinstance(api_resp, dict) else 'Not a dict'}")
-                 print(f"DEBUG: Full Response: {str(api_resp)[:300]}")
-                 
-                 # Check success - handle both error:false and success:true
-                 is_success = (api_resp.get("error") == False or api_resp.get("success") == True)
-                 
-                 if is_success:
-                     po_num = api_resp.get("po_number", api_resp.get("data", {}).get("po_number", "Created"))
-                     response_text = f"✅ **Success!** Purchase Order created.\n\n**PO Number:** {po_num}\n\n[Ref ID: {api_resp.get('id', 'N/A')}]"
-                     state["current_step"] = STATE_DONE
-                 else:
-                     msg = api_resp.get("message", "Unknown Error")
-                     
-                     # Extract SAP errors from data array
-                     if isinstance(api_resp.get("data"), list):
-                         sap_errors = [d.get("msg", "") for d in api_resp["data"] if d.get("type") == "E"]
-                         if sap_errors:
-                             msg = "SAP Errors: " + " | ".join(sap_errors)
-                     
-                     response_text = f"❌ **Submission Failed**\n\nError: {msg}\n\nResponse: {str(api_resp)[:400]}"
-                 
-                 print(f"DEBUG: Returning response: {response_text[:100]}")
-                 return response_text
-             else:
-                 return "You cannot create a PO without line items."
+        # ===== STATE: PO_INTENT =====
+        elif current_step == STATE_PO_INTENT:
+            # Extract all entities from the intent message
+            extracted = self.nlu.extract_po_intent(user_text)
+            print(f"DEBUG: Extracted PO Intent: {extracted}")
+            
+            # Store extracted entities
+            state["extracted_entities"] = extracted
+            
+            # Process PO Type
+            if extracted.get("po_type"):
+                payload["po_type"] = extracted["po_type"]
+            
+            # Process Supplier
+            if extracted.get("supplier_name"):
+                suppliers = self.api.search_suppliers(query=extracted["supplier_name"], limit=1)
+                if suppliers:
+                    payload["vendor_id"] = suppliers[0]["vendor_id"]
+                    # Fetch alternate details
+                    alt_details = self.api.get_alternate_supplier_details(suppliers[0]["vendor_id"])
+                    payload["alternate_supplier_name"] = alt_details["alternate_supplier_name"]
+                    payload["alternate_supplier_email"] = alt_details["alternate_supplier_email"]
+                    payload["alternate_supplier_contact_number"] = alt_details["alternate_supplier_contact_number"]
+                    
+                    payload["alternate_supplier_email"] = alt_details["alternate_supplier_email"]
+                    payload["alternate_supplier_contact_number"] = alt_details["alternate_supplier_contact_number"]
+                    
+                    # Auto-set currency REMOVED to ask user
+                    # curr_list = self.api.get_currencies()
+                    # payload["currency"] = curr_list[0] if curr_list else "INR"
+            
+            # Process Material and create line item
+            if extracted.get("material_name"):
+                materials = self.api.get_materials(query=extracted["material_name"])
+                if materials:
+                    mat = materials[0]
+                    
+                    # Create line item
+                    # Create line item
+                    new_item = {
+                        "short_text": mat["name"],
+                        "material_id": int(mat["id"]),
+                        "unit_id": int(mat.get("unit_id", 0)), # Use pre-extracted unit_id
+                        "price": float(mat["price"]),
+                        "material_group_id": int(mat["material_group_id"]),
+                        "tax_code": None, # Force manual collection
+                        "quantity": int(extracted.get("quantity", 1)),
+                        "subServices": "",
+                        "control_code": ""
+                    }
+                    
+                    # Override price if extracted
+                    if extracted.get("price"):
+                        new_item["price"] = float(extracted["price"])
+                        
+                    # Set delivery date if extracted
+                    if extracted.get("delivery_date"):
+                        new_item["delivery_date"] = extracted["delivery_date"]
+                    
+                    # Calculate subtotal
+                    new_item["sub_total"] = new_item["quantity"] * new_item["price"]
+                    # tax field is internal only, will be popped or ignored by API if not in schema
+                    # But prompt says: Keep tax internal only.
+                    new_item["tax"] = 0 
+                    new_item["total_value"] = new_item["sub_total"]
+                    
+                    # Store in temp for delivery date
+                    state["temp_line_item"] = new_item
+            
+            # Process Dates
+            if extracted.get("po_date"):
+                payload["po_date"] = extracted["po_date"]
+            if extracted.get("validity_end"):
+                payload["validityEnd"] = extracted["validity_end"]
+                
+            # Process Organization
+            if extracted.get("purchase_org"):
+                orgs = self.api.get_purchase_orgs()
+                # Check for ID (digits) or Name match
+                org_text = str(extracted["purchase_org"]).lower()
+                if org_text.isdigit():
+                    payload["purchase_org_id"] = int(org_text)
+                else:
+                    matches = [o for o in orgs if org_text in o['name'].lower()]
+                    if len(matches) == 1:
+                        payload["purchase_org_id"] = int(matches[0]["id"])
+            
+            # Process Plant (Requires Org ID)
+            if extracted.get("plant") and payload.get("purchase_org_id"):
+                plants = self.api.get_plants(org_ids=[payload["purchase_org_id"]])
+                plant_text = str(extracted["plant"]).lower()
+                
+                # STRICT FIX: Never assign text directly. Must match ID/name.
+                matches = [p for p in plants if plant_text in p['name'].lower() or plant_text == str(p['id']).lower()]
+                if len(matches) == 1:
+                    payload["plant_id"] = matches[0]["id"] # Valid UUID
+            
+            # Process Purchase Group (Requires Org ID)
+            if extracted.get("purchase_group") and payload.get("purchase_org_id"):
+                groups = self.api.get_purchase_groups(org_ids=[payload["purchase_org_id"]])
+                group_text = str(extracted["purchase_group"]).lower()
+                matches = [g for g in groups if group_text in g['name'].lower()]
+                if len(matches) == 1:
+                    payload["purchase_grp_id"] = int(matches[0]["id"])
+            
+            # Transition to collecting
+            state["current_step"] = STATE_COLLECTING
+            
+            # Build response
+            response_parts = ["Got it! I've captured:"]
+            if payload.get("po_type"):
+                response_parts.append(f"- PO Type: **{payload['po_type']}**")
+            if payload.get("vendor_id"):
+                response_parts.append(f"- Supplier: **{extracted.get('supplier_name')}**")
+            if state.get("temp_line_item"):
+                item = state["temp_line_item"]
+                response_parts.append(f"- Material: **{item['short_text']}** (Qty: {item['quantity']}, Price: {item['price']})")
+            
+            # Add confirmation for new fields
+            if payload.get("po_date"):
+                response_parts.append(f"- PO Date: **{payload['po_date']}**")
+            if payload.get("validityEnd"):
+                response_parts.append(f"- Validity: **{payload['validityEnd']}**")
+            if payload.get("purchase_org_id"):
+                response_parts.append(f"- Purchase Org ID: **{payload['purchase_org_id']}**")
+            if payload.get("plant_id"):
+                response_parts.append(f"- Plant ID: **{payload['plant_id']}**")
+            if payload.get("purchase_grp_id"):
+                response_parts.append(f"- Purchase Group ID: **{payload['purchase_grp_id']}**")
+            
+            response_parts.append("\nLet me collect the remaining details...")
+            response_text = "\n".join(response_parts)
+            
+            # Ask next question
+            next_q = self.ask_next_question(state)
+            if next_q:
+                response_text += f"\n\n{next_q}"
         
-        if current_step == STATE_PO_TYPE:
-            # Check if user provided PO Type info
-            po_sub_type = entities.get("po_sub_type")
-            
-            # Simple keyword matching fallback if NLU fails or is generic
-            if not po_sub_type:
-                lower_text = user_text.lower()
-                for pt in self.api.get_po_sub_types():
-                    if pt.lower() in lower_text:
-                        po_sub_type = pt
-                        break
-            
-            if po_sub_type:
-                # MAP DISPLAY NAME TO INTERNAL CODE (camelCase)
-                po_type_map = {
-                    "Regular Purchase": "regularPurchase",
-                    "Service": "service",
-                    "Asset": "asset",
-                    "Internal Order Material": "internalOrderMaterial",
-                    "Internal Order Service": "internalOrderService",
-                    "Network": "network",
-                    "Network Service": "networkService",
-                    "Cost Center Material": "costCenterMaterial",
-                    "Cost Center Service": "costCenterService",
-                    "Project Service": "projectService",
-                    "Project Material": "projectMaterial",
-                    "Stock Transfer Inter": "stockTransferInter",
-                    "Stock Transfer Intra": "stockTransferIntra"
-                }
-                payload["po_type"] = po_type_map.get(po_sub_type, "regularPurchase")
-                payload["is_pr_based"] = entities.get("is_pr_based", False)
-                state["current_step"] = STATE_SUPPLIER
-                response_text = f"Selected PO Type: **{po_sub_type}**. \n\nNow, please select a **Supplier**. \nHere are the top suppliers:"
-            else:
-                response_text = "Please select a valid PO Type (e.g., 'Regular Purchase', 'Service', 'Asset')."
-
-        elif current_step == STATE_SUPPLIER:
-            supplier_name = entities.get("supplier_name") or user_text
-            
-            # Search API
-            results = self.api.search_suppliers(query=supplier_name, limit=1)
-            
-            if results:
-                selected_supplier = results[0]
-                payload["vendor_id"] = selected_supplier["vendor_id"]
-                
-                # Fetch alternate supplier details from API
-                alt_details = self.api.get_alternate_supplier_details(selected_supplier["vendor_id"])
-                payload["alternate_supplier_name"] = alt_details["alternate_supplier_name"]
-                payload["alternate_supplier_email"] = alt_details["alternate_supplier_email"]
-                payload["alternate_supplier_contact_number"] = alt_details["alternate_supplier_contact_number"]
-                
-                # Fetch Currency automatically
-                curr_list = self.api.get_currencies()
-                payload["currency"] = curr_list[0] if curr_list else "INR" 
-                
-                state["current_step"] = STATE_SUPPLIER_DETAILS
-                response_text = f"Selected Supplier: **{selected_supplier['name']}** ({selected_supplier['vendor_id']}). \n\nCurrency set to **{payload['currency']}**.\n\nPlease provide the **PO Date** (YYYY-MM-DD) and **Validity End Date**."
-            else:
-                response_text = f"I couldn't find a supplier matching '{supplier_name}'. Please try searching again (e.g., 'Tata', 'Infosys')."
-
-        elif current_step == STATE_SUPPLIER_DETAILS:
-            # Extract dates - CLEAN PARSING
-            import re
-            
-            # Expected format: "PO Date: YYYY-MM-DD, Validity: YYYY-MM-DD"
-            # OR simple text input: "2025-12-21"
-            
-            po_match = re.search(r'PO Date: (\d{4}-\d{2}-\d{2})', user_text)
-            val_match = re.search(r'Validity: (\d{4}-\d{2}-\d{2})', user_text)
-            
-            # Fallback for simple typing
-            simple_date = re.search(r'(\d{4}-\d{2}-\d{2})', user_text)
-            
-            clean_po_date = None
-            if po_match:
-                clean_po_date = po_match.group(1)
-            elif simple_date:
-                clean_po_date = simple_date.group(1)
-                
-            clean_validity = "2025-12-31" # Default
-            if val_match:
-                clean_validity = val_match.group(1)
-            elif entities.get("validity_date"):
-                clean_validity = entities.get("validity_date")
-
-            if clean_po_date:
-                payload["po_date"] = clean_po_date
-                payload["validityEnd"] = clean_validity
-                
-                state["current_step"] = STATE_ORG_DETAILS
-                response_text = f"PO Date set to {clean_po_date}. \n\nNow, please select the **Purchase Organization**, **Plant**, and **Purchase Group**."
-            else:
-                response_text = "Please provide a valid PO Date (YYYY-MM-DD format, e.g., 2025-12-21)."
-
-        elif current_step == STATE_ORG_DETAILS:
-            # Extraction
-            p_org = entities.get("purchase_org")
-            plant = entities.get("plant")
-            p_grp = entities.get("purchase_group")
-            
-            # Mapping logic (simplified for Hackathon/Demo speed)
-            # If NLU picked them up, great. If not, auto-select first ones for demo flow if user says "First one" or "Default"
-            # Or enforce strictness. Let's try to map from text.
-            
-            # Mock mapping logic:
-            if not payload.get("purchase_org_id") and p_org:
-                # Find ID
-                pass # Logic to match name to ID
-            
-            # For robustness in this demo, let's assume we set defaults if text is vague, or map strictly if specific.
-            # Let's just set the IDs if we find loose matches in text, or ask again.
-            
-            # AUTO-RESOLVER - Use regex to extract exact IDs from structured message
-            # Expected format: "Selected: Purchase Org 40, Plant 25b8ef1f..., Group 365"
-            import re
-            
-            # Extract IDs using regex patterns
-            org_match = re.search(r'Purchase Org (\d+)', user_text)
-            plant_match = re.search(r'Plant ([a-f0-9\-]+)', user_text)
-            group_match = re.search(r'Group (\d+)', user_text)
-            
-            if org_match:
-                payload["purchase_org_id"] = int(org_match.group(1))
-            if plant_match:
-                payload["plant_id"] = plant_match.group(1)
-            if group_match:
-                payload["purchase_grp_id"] = int(group_match.group(1))
-            
-            # Check if we have all 3
-            missing = []
-            if "purchase_org_id" not in payload: missing.append("Purchase Org")
-            if "plant_id" not in payload: missing.append("Plant")
-            if "purchase_grp_id" not in payload: missing.append("Purchase Group")
+        # ===== STATE: COLLECTING =====
+        elif current_step == STATE_COLLECTING:
+            missing = state.get("missing_fields", [])
+            last_q = state.get("last_question", "")
             
             if not missing:
-                state["current_step"] = STATE_COMMERCIALS
-                response_text = f"Organization details set. (Org: {payload['purchase_org_id']}, Plant: {payload['plant_id']}, Grp: {payload['purchase_grp_id']}).\n\nNow, please provide **Project**, **Payment Terms**, and **Incoterms**."
-            else:
-                response_text = f"I identified: {', '.join([k for k in ['purchase_org_id','plant_id','purchase_grp_id'] if k in payload])}. \n\nPlease specify the missing: **{', '.join(missing)}**."
-
-        elif current_step == STATE_COMMERCIALS:
-            # Similar extraction
-            proj = entities.get("project")
-            pay = entities.get("payment_terms")
-            inco = entities.get("incoterms")
-            remarks = entities.get("remarks")
+                missing = self.identify_missing_fields(payload, state)
+                state["missing_fields"] = missing
             
-            # Set defaults for demo if missing, but ideally ask
-            # Assume user input "Project 001, Pay immediately, CIF"
-            
-            # Search Lists
-            all_projects = self.api.get_projects()
-            all_pay = self.api.get_payment_terms()
-            all_inco = self.api.get_incoterms()
-            
-            if proj:
-                # Match code or name
-                p_obj = next((x for x in all_projects if proj.lower() in x["project_name"].lower() or proj in x["project_code"]), None)
-                if p_obj: 
-                    payload["projects"][0]["project_code"] = p_obj["project_code"]
-                    payload["projects"][0]["project_name"] = p_obj["project_name"]
-            
-            # Fallback for Project
-            if not payload["projects"][0]["project_code"]:
-                 if all_projects:
-                     # Pick first valid project for demo flow
-                     p0 = all_projects[0]
-                     payload["projects"][0]["project_code"] = p0["project_code"]
-                     payload["projects"][0]["project_name"] = p0["project_name"]
-                 else:
-                     payload["projects"][0]["project_code"] = "P01"
-                     payload["projects"][0]["project_name"] = "Default Helper"
-
-            # Payment Terms ID (Int)
-            valid_pay_id = 1
-            if all_pay:
-                # Try to find match if user text has "Immediate" etc
-                # for now default to first for valid submission
-                # Ensure we parse ID as int
-                try: 
-                    valid_pay_id = int(all_pay[0]["id"])
-                except: pass
-            payload["payment_terms"] = valid_pay_id
-            
-            # Inco Terms ID (Int)
-            valid_inco_id = 1
-            if all_inco:
-                try:
-                    valid_inco_id = int(all_inco[0]["id"])
-                except: pass
-            payload["inco_terms"] = valid_inco_id
-            
-            payload["remarks"] = remarks if remarks else "Created via AI Agent"
-            
-            state["current_step"] = STATE_LINE_ITEMS_START
-            response_text = f"Commercials captured (PayTerm:{valid_pay_id}, Inco:{valid_inco_id}). \n\nLet's add Line Items. "
-            
-            # Auto-transition logic
-            if payload.get("po_type") == "Regular Purchase":
-                response_text += "Since this is a **Regular Purchase**, please search for a **Material** (e.g., 'Steel', 'Cement')."
-            else:
-                response_text += "Please provided the **Service** description."
+            if not missing:
+                # All fields collected, move to confirm
+                state["current_step"] = STATE_CONFIRM
                 
-            state["current_step"] = STATE_LINE_ITEM_DETAILS
-            state["temp_data"] = {"new_item": {}}
+                # Finalize line item
+                if state.get("temp_line_item"):
+                    payload["line_items"].append(state["temp_line_item"])
+                    state["temp_line_item"] = {}
+                
+                # Calculate total
+                payload["total"] = sum([item["sub_total"] for item in payload["line_items"]])
+                
+                # Show summary
+                response_text = self._generate_summary(payload)
+                response_text += "\n\n**Should I create the Purchase Order now?** (Type 'yes' to confirm)"
+                
+            else:
+                current_field = missing[0]
+                
+                # Check for "show options" intent
+                intent_type = self.nlu.detect_intent_type(user_text)
+                
+                if intent_type == "show_options":
+                    # Show options for current field
+                    if current_field == "payment_terms":
+                        terms = self.api.get_payment_terms()
+                        response_text = self.format_options(terms, "id", "name")
+                    elif current_field == "inco_terms":
+                        terms = self.api.get_incoterms()
+                        response_text = self.format_options(terms, "id", "name")
+                    elif current_field == "tax_code":
+                        codes = self.api.get_tax_codes()
+                        response_text = self.format_options(codes, "id", "description")
+                    else:
+                        response_text = "Options not available for this field. Please provide a value."
+                
+                else:
+                    # Process the value
+                    if current_field == "po_date":
+                        date_result = self.nlu.extract_date_with_context(user_text, last_q)
+                        if date_result.get("purpose") == "unclear":
+                            response_text = f"You mentioned a date ({date_result.get('date')}). Is this the **PO date**, **validity date**, or **delivery date**?"
+                        else:
+                            payload["po_date"] = date_result.get("date")
+                            missing.remove("po_date")
+                            next_q = self.ask_next_question(state)
+                            response_text = f"✅ PO Date set to {date_result.get('date')}.\n\n{next_q}" if next_q else "✅ PO Date set."
+                    
+                    elif current_field == "validityEnd":
+                        date_result = self.nlu.extract_date_with_context(user_text, last_q)
+                        payload["validityEnd"] = date_result.get("date")
+                        missing.remove("validityEnd")
+                        next_q = self.ask_next_question(state)
+                        response_text = f"✅ Validity End set to {date_result.get('date')}.\n\n{next_q}" if next_q else "✅ Validity set."
+                    
+                    elif current_field == "delivery_date":
+                        date_result = self.nlu.extract_date_with_context(user_text, last_q)
+                        if state.get("temp_line_item"):
+                            state["temp_line_item"]["delivery_date"] = date_result.get("date")
+                        missing.remove("delivery_date")
+                        next_q = self.ask_next_question(state)
+                        response_text = f"✅ Delivery Date set to {date_result.get('date')}.\n\n{next_q}" if next_q else "✅ Delivery date set."
+                    
+                    elif current_field == "purchase_org_id":
+                        # Try to match organization
+                        orgs = self.api.get_purchase_orgs()
+                        
+                        # Check if user provided ID directly
+                        if user_text.strip().isdigit():
+                            org_id = int(user_text.strip())
+                            payload["purchase_org_id"] = org_id
+                            missing.remove("purchase_org_id")
+                            next_q = self.ask_next_question(state)
+                            response_text = f"✅ Purchase Org set to {org_id}.\n\n{next_q}" if next_q else "✅ Org set."
+                        else:
+                            # Search by name
+                            matches = [o for o in orgs if user_text.lower() in o['name'].lower()]
+                            if len(matches) == 1:
+                                payload["purchase_org_id"] = int(matches[0]["id"])
+                                missing.remove("purchase_org_id")
+                                next_q = self.ask_next_question(state)
+                                response_text = f"✅ Purchase Org set to **{matches[0]['name']}**.\n\n{next_q}" if next_q else "✅ Org set."
+                            elif len(matches) > 1:
+                                response_text = self.format_options(matches, "id", "name")
+                            else:
+                                response_text = "No matches found. Please try again or type the ID."
+                    
+                    elif current_field == "plant_id":
+                        org_id = payload.get("purchase_org_id")
+                        if not org_id:
+                            response_text = "Please set Purchase Org first."
+                        else:
+                            plants = self.api.get_plants(org_ids=[org_id])
+                            
+                            # Strict validation against API list
+                            target_uuid = None
+                            
+                            # Normalize user text
+                            u_text = user_text.strip().lower()
+                            
+                            # 1. Check for exact ID match in list
+                            id_matches = [p for p in plants if str(p['id']).lower() == u_text]
+                            if id_matches:
+                                target_uuid = id_matches[0]['id']
+                            else:
+                                # 2. Check for name substring match
+                                # Try full substring first
+                                name_matches = [p for p in plants if u_text in p['name'].lower()]
+                                
+                                # If no match, try "all words present" (flexible for typos/spacing)
+                                if not name_matches:
+                                    search_words = u_text.replace("-", " ").split()
+                                    name_matches = [p for p in plants if all(word in p['name'].lower() for word in search_words)]
 
-        elif current_step == STATE_LINE_ITEM_DETAILS:
-             # This is a repeatable loop
-             item = state["temp_data"].get("new_item", {})
-             is_regular = payload.get("po_type") == "Regular Purchase"
-             
-             # Extract item details
-             mat_name = entities.get("material_name")
-             srv_name = entities.get("service_name")
-             qty = entities.get("quantity")
-             price = entities.get("price")
-             
-             # 1. Identify Material/Service
-             if is_regular and not item.get("material_id"):
-                 # Search Material
-                 query = mat_name or user_text
-                 mat_results = self.api.get_materials(query=query)
-                 if mat_results:
-                     found = mat_results[0]
-                     item["material_id"] = found["id"]
-                     item["short_text"] = found["name"]
-                     item["unit_id"] = int(found["unit_id"])
-                     item["price"] = float(found["price"]) 
-                     # Store extra metadata
-                     item["material_group_id"] = int(found["material_group_id"])
-                     item["tax_code"] = int(found["tax_code"])
-                     response_text = f"Found **{found['name']}**. "
-                 else:
-                     return "Could not find that material. Please try 'Steel' or 'Cement'."
-             
-             elif not is_regular and not item.get("short_text"):
-                 item["short_text"] = srv_name or user_text
-                 item["material_id"] = "" # No material ID for services usually
-                 response_text = f"Added Service: **{item['short_text']}**. "
+                                if len(name_matches) == 1:
+                                    target_uuid = name_matches[0]['id']
+                                else:
+                                    matches = name_matches # For options display
+                            
+                            if target_uuid:
+                                payload["plant_id"] = target_uuid
+                                missing.remove("plant_id")
+                                next_q = self.ask_next_question(state)
+                                # Fetch name for display
+                                plant_name = next((p['name'] for p in plants if p['id'] == target_uuid), target_uuid)
+                                response_text = f"✅ Plant set to **{plant_name}**.\n\n{next_q}" if next_q else "✅ Plant set."
+                            elif 'matches' in locals() and len(matches) > 1:
+                                response_text = self.format_options(matches, "id", "name")
+                            else:
+                                response_text = "No matches found. Please try again or type the ID."
 
-             # 2. Update Quantity / Price if provided
-             if qty: item["quantity"] = float(qty)
-             if price: item["price"] = float(price)
-             
-             # Check completeness
-             needed = []
-             if not item.get("quantity"): needed.append("Quantity")
-             if not item.get("price") and not item.get("material_id"): needed.append("Price") # Mat usually has price
-             
-             if needed:
-                 response_text += f"\nPlease provide: **{', '.join(needed)}**."
-                 state["temp_data"]["new_item"] = item
-             else:
-                 # Calculate totals
-                 # FIX: Quantity should be int if whole number? API might accept float. 
-                 # User working payload has int. Let's force int if matches.
-                 qty_val = float(item.get("quantity", 0))
-                 if qty_val.is_integer(): qty_val = int(qty_val)
-                 item["quantity"] = qty_val
-                 
-                 price_val = float(item.get("price", 0))
-                 item["sub_total"] = qty_val * price_val
-                 
-                 # Tax 
-                 # Use stored values or defaults matching working JSON
-                 if "tax_code" not in item: item["tax_code"] = 118 # Default from working JSON
-                 if "material_group_id" not in item: item["material_group_id"] = 520 # Default
-                 
-                 # Calculate tax
-                 item["tax"] = 12 # Hardcoded/Mock tax amount logic
-                 item["total_value"] = item["sub_total"] + item["tax"]
-                 
-                 # Delivery Date
-                 # Use PO Date + 7 days or just PO Date?
-                 # Working JSON has delivery_date "2025-12-23" (PO Date was Dec 16 -> +7 days)
-                 start_date = payload.get("po_date", "2025-12-16")
-                 try:
-                     import datetime
-                     dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
-                     res_dt = dt + datetime.timedelta(days=7)
-                     item["delivery_date"] = res_dt.strftime("%Y-%m-%d")
-                 except:
-                     item["delivery_date"] = start_date
-                 
-                 # item["material_group_id"] is set above
-                 
-                 # Add to main payload
-                 payload["line_items"].append(item)
-                 
-                 # Calculate Grand Total
-                 total = sum([x["sub_total"] for x in payload["line_items"]])
-                 payload["total"] = total
-                 
-                 state["current_step"] = STATE_CONFIRM
-                 response_text = f"Added Item: {item['short_text']} (Qty: {qty_val}, Total: {item['sub_total']}).\n\nDo you want to **add another item** or **Create PO**?"
-                 state["temp_data"] = {} # Clear temp
+                    
+                    elif current_field == "purchase_grp_id":
+                        org_id = payload.get("purchase_org_id")
+                        if not org_id:
+                            response_text = "Please set Purchase Org first."
+                        else:
+                            groups = self.api.get_purchase_groups(org_ids=[org_id])
+                            
+                            if user_text.strip().isdigit():
+                                payload["purchase_grp_id"] = int(user_text.strip())
+                                missing.remove("purchase_grp_id")
+                                next_q = self.ask_next_question(state)
+                                response_text = f"✅ Purchase Group set.\n\n{next_q}" if next_q else "✅ Group set."
+                            else:
+                                matches = [g for g in groups if user_text.lower() in g['name'].lower()]
+                                if len(matches) == 1:
+                                    payload["purchase_grp_id"] = int(matches[0]["id"])
+                                    missing.remove("purchase_grp_id")
+                                    next_q = self.ask_next_question(state)
+                                    response_text = f"✅ Purchase Group set to **{matches[0]['name']}**.\n\n{next_q}" if next_q else "✅ Group set."
+                                elif len(matches) > 1:
+                                    response_text = self.format_options(matches, "id", "name")
+                                else:
+                                    response_text = "No matches found. Please try again or type the ID."
+                    
+                    elif current_field == "optional_prompt":
+                        if user_text.lower().strip() in ["yes", "y"]:
+                            state["fill_optional"] = True
+                            state["optional_asked"] = True
+                            # Missing fields will be re-calculated next turn to include optional ones
+                            response_text = "Okay, let's fill them."
+                        else:
+                            state["fill_optional"] = False
+                            state["optional_asked"] = True
+                            # Set defaults immediately so they aren't "missing"
+                            # Payment Terms Default
+                            terms = self.api.get_payment_terms()
+                            if terms: payload["payment_terms"] = int(terms[0]["id"])
+                            # Inco Terms Default
+                            inco = self.api.get_incoterms()
+                            if inco: payload["inco_terms"] = int(inco[0]["id"])
+                            # Projects Default (set to empty list to skip)
+                            payload["projects"] = []
+                            
+                            # Check if we are done (should be yes)
+                            rem_missing = self.identify_missing_fields(payload, state)
+                            if not rem_missing:
+                                state["current_step"] = STATE_CONFIRM
+                                
+                                # Finalize line item
+                                if state.get("temp_line_item"):
+                                    item = state["temp_line_item"]
+                                    # Ensure defaults for internal logic
+                                    if item.get("tax_code") is None: item["tax_code"] = 119 
+                                    if not item.get("total_value"): item["total_value"] = item["sub_total"]
+                                    state["payload"]["line_items"].append(item)
+                                    state["temp_line_item"] = {}
+                                
+                                # Calculate Total
+                                total = sum(i["total_value"] for i in state["payload"]["line_items"])
+                                payload["total"] = total
+                                
+                                summary = self._generate_summary(payload)
+                                response_text = f"Skipping optional fields.\n\n{summary}\n\nShould I create the Purchase Order now? (Type 'yes' to confirm)"
+                            else:
+                                next_q = self.ask_next_question(state)
+                                response_text = f"Skipping optional fields.\n\n{next_q}"
 
+                    elif current_field == "projects":
+                         p_text = user_text.strip()
+                         # Fetch projects to validate
+                         projs = self.api.get_projects()
+                         matches = [p for p in projs if p_text.lower() in p['project_code'].lower() or p_text.lower() in p['project_name'].lower()]
+                         
+                         if matches:
+                             # Set the FIRST match
+                             payload["projects"] = [{
+                                 "project_code": matches[0]["project_code"], 
+                                 "project_name": matches[0]["project_name"]
+                             }]
+                             if "projects" in missing: missing.remove("projects")
+                             next_q = self.ask_next_question(state)
+                             response_text = f"✅ Project set to **{matches[0]['project_name']}**.\n\n{next_q}" if next_q else "✅ Project set."
+                         elif p_text.lower() == "show options":
+                             response_text = self.format_options(projs, "project_code", "project_name")
+                         else:
+                             response_text = "No matching project found. Type 'show options' to see list."
+
+                    elif current_field == "payment_terms":
+                        if user_text.lower().strip() == "default":
+                            terms = self.api.get_payment_terms()
+                            if terms:
+                                payload["payment_terms"] = int(terms[0]["id"])
+                                missing.remove("payment_terms")
+                                next_q = self.ask_next_question(state)
+                                response_text = f"✅ Payment Terms set to default.\n\n{next_q}" if next_q else "✅ Payment terms set."
+                        elif user_text.strip().isdigit():
+                            payload["payment_terms"] = int(user_text.strip())
+                            missing.remove("payment_terms")
+                            next_q = self.ask_next_question(state)
+                            response_text = f"✅ Payment Terms set.\n\n{next_q}" if next_q else "✅ Payment terms set."
+                        else:
+                            response_text = "Please provide the payment term ID or type 'default' or 'show options'."
+                    
+                    elif current_field == "inco_terms":
+                        if user_text.lower().strip() == "default":
+                            terms = self.api.get_incoterms()
+                            if terms:
+                                payload["inco_terms"] = int(terms[0]["id"])
+                                missing.remove("inco_terms")
+                                next_q = self.ask_next_question(state)
+                                response_text = f"✅ Incoterms set to default.\n\n{next_q}" if next_q else "✅ Incoterms set."
+                        elif user_text.strip().isdigit():
+                            payload["inco_terms"] = int(user_text.strip())
+                            missing.remove("inco_terms")
+                            next_q = self.ask_next_question(state)
+                            response_text = f"✅ Incoterms set.\n\n{next_q}" if next_q else "✅ Incoterms set."
+                        else:
+                            response_text = "Please provide the incoterm ID or type 'default' or 'show options'."
+                    
+                    elif current_field == "currency":
+                        curr_text = user_text.strip().upper()
+                        # Basic validation
+                        if len(curr_text) == 3:
+                            payload["currency"] = curr_text
+                            missing.remove("currency")
+                            next_q = self.ask_next_question(state)
+                            response_text = f"✅ Currency set to **{curr_text}**.\n\n{next_q}" if next_q else "✅ Currency set."
+                        else:
+                            response_text = "Please provide a valid 3-letter currency code (e.g., INR, USD)."
+                            
+                    elif current_field == "tax_code":
+                        if user_text.strip().isdigit():
+                            if state.get("temp_line_item"):
+                                state["temp_line_item"]["tax_code"] = int(user_text.strip())
+                            missing.remove("tax_code")
+                            next_q = self.ask_next_question(state)
+                            response_text = f"✅ Tax Code set.\n\n{next_q}" if next_q else "✅ Tax code set."
+                        else:
+                            response_text = "Please provide the tax code ID or type 'show options'."
+        
+        # ===== STATE: CONFIRM =====
         elif current_step == STATE_CONFIRM:
-            if "add" in user_text.lower() or "another" in user_text.lower():
-                 state["current_step"] = STATE_LINE_ITEM_DETAILS
-                 state["temp_data"] = {"new_item": {}}
-                 
-                 if payload.get("po_type") == "Regular Purchase":
-                     response_text = "Okay, search for the next **Material**."
-                 else:
-                     response_text = "Okay, describe the next **Service**."
-            elif "create" in user_text.lower() or "yes" in user_text.lower():
-                # Trigger Create
-                api_resp = self.api.create_po(payload)
-                if api_resp["success"]:
-                    response_text = f"✅ **Success!** Purchase Order created.\n\n**PO Number:** {api_resp['po_number']}"
+            intent_type = self.nlu.detect_intent_type(user_text)
+            
+            if intent_type == "confirm":
+                # Create PO
+                print(f"DEBUG: Creating PO with payload keys: {list(payload.keys())}")
+                
+                # Clean payload before submission
+                api_payload = payload.copy()
+                
+                # Remove total_value from line items
+                if "line_items" in api_payload:
+                    for item in api_payload["line_items"]:
+                        item.pop("total_value", None)
+                        item["subServices"] = ""
+                        item["control_code"] = ""
+                
+                # Set default project if empty
+                # Set default project if empty
+                # Check if first project has empty code
+                if not api_payload.get("projects") or (len(api_payload["projects"]) > 0 and not api_payload["projects"][0]["project_code"]):
+                    projects = self.api.get_projects()
+                    if projects:
+                        api_payload["projects"] = [{
+                            "project_code": projects[0]["project_code"],
+                            "project_name": projects[0]["project_name"]
+                        }]
+                    else:
+                        api_payload["projects"] = [] # Send empty list if no project found
+                
+                # Set remarks if empty
+                if not api_payload.get("remarks"):
+                    api_payload["remarks"] = "Created via AI Agent"
+                
+                print(f"DEBUG: Sending payload: {json.dumps(api_payload, indent=2)}")
+                
+                # Call API
+                api_resp = self.api.create_po(api_payload)
+                
+                print(f"DEBUG: API Response: {str(api_resp)[:300]}")
+                
+                # Check success
+                is_success = (api_resp.get("error") == False or api_resp.get("success") == True)
+                
+                if is_success:
+                    po_num = api_resp.get("po_number", api_resp.get("data", {}).get("po_number", "Created"))
+                    response_text = f"✅ **Success!** Purchase Order created.\n\n**PO Number:** {po_num}\n\n[Ref ID: {api_resp.get('id', 'N/A')}]"
                     state["current_step"] = STATE_DONE
                 else:
-                    response_text = f"❌ Error: {api_resp['message']}"
+                    msg = api_resp.get("message", "Unknown Error")
+                    
+                    # Extract SAP errors
+                    if isinstance(api_resp.get("data"), list):
+                        sap_errors = [d.get("msg", "") for d in api_resp["data"] if d.get("type") == "E"]
+                        if sap_errors:
+                            msg = "SAP Errors: " + " | ".join(sap_errors)
+                    
+                    response_text = f"❌ **Submission Failed**\n\nError: {msg}\n\nResponse: {str(api_resp)[:400]}"
+            
+            elif intent_type == "reject":
+                response_text = "PO creation cancelled. Type 'Hi' to start over."
+                state["current_step"] = STATE_GREETING
+            
             else:
-                 response_text = "Please say 'Create' to finalize or 'Add item' to continue."
-
+                response_text = "Please confirm: Type **'yes'** to create the PO, or **'no'** to cancel."
+        
+        # ===== STATE: DONE =====
+        elif current_step == STATE_DONE:
+            response_text = "PO has been created. Type 'Hi' to create another PO."
+            if "hi" in user_text.lower() or "hello" in user_text.lower():
+                # Reset
+                new_state = self.get_initial_state()
+                state.update(new_state)
+                response_text = "Hi 👋 What type of PO do you want to create?\n\n1. **Independent PO**\n2. PR-based PO _(coming soon)_\n3. RFQ-based PO _(coming soon)_"
+        
         return response_text
+
+    def _generate_summary(self, payload):
+        """Generate summary for confirmation"""
+        lines = ["📋 **Purchase Order Summary:**\n"]
+        
+        if payload.get("po_type"):
+            lines.append(f"**PO Type:** {payload['po_type']}")
+        
+        if payload.get("vendor_id"):
+            lines.append(f"**Supplier ID:** {payload['vendor_id']}")
+        
+        if payload.get("po_date"):
+            lines.append(f"**PO Date:** {payload['po_date']}")
+        
+        if payload.get("validityEnd"):
+            lines.append(f"**Validity:** {payload['validityEnd']}")
+        
+        if payload.get("line_items"):
+            lines.append(f"\n**Line Items ({len(payload['line_items'])}):**")
+            for i, item in enumerate(payload["line_items"], 1):
+                lines.append(f"{i}. {item['short_text']} - Qty: {item['quantity']}, Price: {item['price']}, Subtotal: {item['sub_total']}")
+        
+        if payload.get("total"):
+            lines.append(f"\n**Total Amount:** ₹{payload['total']}")
+        
+        return "\n".join(lines)
