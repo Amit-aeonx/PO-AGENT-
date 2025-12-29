@@ -73,6 +73,38 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+# Function to handle button click as user input
+def handle_po_type_selection(po_type_text):
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": po_type_text})
+    
+    # Process with agent
+    with st.spinner("Thinking..."):
+        try:
+            response = st.session_state.agent.process_input(
+                po_type_text, 
+                st.session_state.conversation_state
+            )
+            st.session_state.messages.append({"role": "assistant", "content": response})
+        except Exception as e:
+            error_msg = f"❌ Error: {str(e)}"
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+    
+    st.rerun() # Rerun to update the chat UI
+
+# Initial Helper Buttons
+if len(st.session_state.messages) == 1:
+    st.write("### Select PO Type:")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Independent PO", type="primary", use_container_width=True):
+        handle_po_type_selection("Independent PO")
+    
+    if c2.button("PR-based PO (Coming Soon)", disabled=True, use_container_width=True):
+        pass
+        
+    if c3.button("RFQ-based PO (Coming Soon)", disabled=True, use_container_width=True):
+        pass
+
 # User Input
 if prompt := st.chat_input("Type your message here..."):
     # Add user message

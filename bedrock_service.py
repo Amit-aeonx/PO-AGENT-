@@ -252,3 +252,123 @@ Return ONLY valid JSON with the extracted value."""
         
         result = self._call_claude(system_prompt, user_text)
         return result if "entities" in result else {"entities": result}
+
+    def analyze_user_input(self, user_text, current_payload, conversation_history):
+        """
+        Master Agent Logic: Analyzes intent and extracts actions using the system prompt.
+        """
+        try:
+            # Try absolute path first, then relative
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            prompt_path = os.path.join(base_path, "supplierx_po_agent_prompt.md")
+            if not os.path.exists(prompt_path):
+                prompt_path = "supplierx_po_agent_prompt.md"
+                
+            with open(prompt_path, "r", encoding='utf-8') as f:
+                base_prompt = f.read()
+        except Exception as e:
+            print(f"Error loading prompt: {e}")
+            base_prompt = "You are a Purchase Order Agent."
+
+        system_prompt = base_prompt + """
+        
+        INSTRUCTIONS:
+        Analyze the latest user input based on the payload and history.
+        
+        CRITICAL RE-SCAN RULE:
+        If user says "yes", "add them", "proceed", or "do it", and fields are missing:
+        1. SCAN the 'conversation_history' for any entities or values mentioned previously but not in 'current_payload'.
+        2. GENERATE actions to add those missing values immediately.
+        
+        OUTPUT FORMAT:
+        Return a JSON object with:
+        {
+            "intents": ["INTENT_NAME", ...],
+            "actions": [
+                {
+                    "operation": "ADD|UPDATE|REMOVE", 
+                    "field_path": "payload_key", 
+                    "value": "extracted value"
+                }
+            ],
+            
+            FIELD_PATH_REFERENCE:
+            - po_type (Values: "regularPurchase", "service", etc.)
+            - vendor_id (Supplier ID or name)
+            - purchase_org_id (Org ID or name)
+            - plant_id (Plant ID or name)
+            - purchase_grp_id (Group ID or name)
+            - po_date (YYYY-MM-DD)
+            - validityEnd (YYYY-MM-DD)
+            - delivery_date (YYYY-MM-DD)
+            - currency (e.g., INR)
+            - line_items[i].material_id
+            - line_items[i].quantity
+            - line_items[i].price
+            - line_items[i].short_text
+            - line_items[i].plant_id (if distinct)
+
+            "items_to_resolve": [
+                {"entity_type": "supplier|material|plant|org|group|project|payment_term|incoterm", "value": "raw text"}
+            ],
+            "thought_process": "Brief explanation of reasoning"
+        }
+        """
+        
+        # Prepare context
+        context_str = json.dumps({
+            "current_payload": current_payload,
+            "conversation_history": conversation_history[-10:] if conversation_history else [],
+            "latest_user_input": user_text
+        }, indent=2, default=str)
+        
+        return self._call_claude(system_prompt, f"Current Context:\n{context_str}")
+
+    def generate_response(self, user_text, analysis_result, execution_results, current_payload, missing_fields):
+        """
+        Generates the final natural language response.
+        """
+        system_prompt = """You are the Voice of the PO Agent. You are efficient, direct, and execution-focused.
+        
+        Your Goal: Generate a response that confirms ACTIONS TAKEN and states MISSING INFO.
+        
+        INPUTS:
+        - User Input: What the user just said.
+        - Analysis: What you understood.
+        - Execution Results: What specifically changed (e.g. "Supplier found and set", "Line item 1 created").
+        - Current Payload: The current state.
+        - Missing Fields: List of fields still needed.
+        
+        STRICT RESPONSE RULES:
+        1. DO NOT use these phrases:
+           - "Let me work on that"
+           - "Would you like to proceed?"
+           - "I need to check..."
+           - "Is there anything else?"
+        
+        2. STRUCTURE your response:
+           - First: Summarize exactly what was added/updated based on 'Execution Results'.
+           - Second: If there are errors (e.g. material not found), state them clearly.
+           - Third: List what is still MISSING (from 'Missing Fields').
+           - Fourth: If 'Missing Fields' is empty, ask EXACTLY: "Everything is ready. Shall I create the purchase order now?"
+           
+        3. BE CONCISE.
+           Example: "I've added the supplier Smartsaa, purchase org, plant, and a line item for 'scooty'. I still need the Purchase Group."
+           
+        4. If CONFIRM_PO was successful:
+           - Announce the PO Number clearly.
+        
+        OUTPUT FORMAT:
+        Return JSON: {"response": "Your message string here"}
+        """
+        
+        user_message = json.dumps({
+            "user_input": user_text,
+            "analysis": analysis_result,
+            "execution_results": execution_results,
+            "payload_summary": current_payload,
+            "missing_fields": missing_fields
+        }, indent=2, default=str)
+        
+        result = self._call_claude(system_prompt, user_message)
+        return result.get("response", "I've updated the details. What would you like to do next?")
