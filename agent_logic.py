@@ -142,7 +142,22 @@ class POAgent:
             
             if not missing:
                 # 2. CONSTRUCT STRICT PAYLOAD (Whitelist approach)
-                # Only include fields explicitly accepted by API
+                
+                # Helper for Date Format: "Fri Jan 23 2026 13:15:24 GMT+0530 (India Standard Time)"
+                def format_date_api(date_val):
+                    if not date_val: return ""
+                    try:
+                        # Try parsing YYYY-MM-DD
+                        dt = datetime.datetime.strptime(str(date_val).split(" ")[0], "%Y-%m-%d")
+                        # Set a default time if none (using fixed time from example or current)
+                        # User example has 13:15:24. Let's use current time 
+                        now = datetime.datetime.now()
+                        dt = dt.replace(hour=now.hour, minute=now.minute, second=now.second)
+                        # Hardcoded timezone part as per user requirement to match "correct" payload
+                        return dt.strftime(f"%a %b %d %Y %H:%M:%S GMT+0530 (India Standard Time)")
+                    except:
+                        return str(date_val) # Fallback
+
                 allowed_header_keys = [
                     "po_type", "vendor_id", "purchase_org_id", "plant_id", "purchase_grp_id",
                     "po_date", "validityEnd", "currency", "line_items", "projects",
@@ -155,36 +170,47 @@ class POAgent:
                 api_payload = {}
                 for key in allowed_header_keys:
                     val = current_payload.get(key)
-                    # Helper: Ensure Optional Fields are "" if missing/None
-                    if key not in ["line_items", "projects"] and (val is None or val is False and key not in ["is_epcg_applicable", "is_pr_based", "is_rfq_based"]):
-                         # Special case: booleans must remain boolean if false
-                         # But for text fields, None -> ""
-                         api_payload[key] = ""
+                    
+                    # Date Formatting
+                    if key in ["po_date", "validityEnd"] and val:
+                        val = format_date_api(val)
+                    
+                    # Handle Boolean/None defaults
+                    if key not in ["line_items", "projects"]:
+                         if val is None:
+                             api_payload[key] = ""
+                         elif isinstance(val, bool):
+                             api_payload[key] = val # Sent as bool, mock_api will stringify
+                         else:
+                             api_payload[key] = val
                     elif key in current_payload:
                         api_payload[key] = val
 
                 # Fix 'noc' if it is "No" -> ""
                 if api_payload.get("noc") == "No":
                     api_payload["noc"] = ""
-
-                # 2.1 Calculate Total
-                try:
-                    total_calc = sum(float(i.get("quantity", 0)) * float(i.get("price", 0)) for i in api_payload.get("line_items", []))
-                    if total_calc > 0:
-                        is_integer = total_calc.is_integer()
-                        api_payload["total"] = str(int(total_calc)) if is_integer else str(total_calc)
-                    elif not api_payload.get("total"): # Propagate from input if set, else explicit 0? Test file has "total"
-                         api_payload["total"] = "0"
-                except:
-                     if not api_payload.get("total"):
-                        api_payload["total"] = "0"
-
-                # Ensure defaults for required lists
+                    
+                # Ensure Defaults for critical fields
                 if "projects" not in api_payload: api_payload["projects"] = []
+                # Projects cleanup
+                clean_projects = []
+                for p in api_payload.get("projects", []):
+                    clean_projects.append({
+                        "project_code": p.get("project_code", ""),
+                        "project_name": p.get("project_name", "")
+                    })
+                if clean_projects:
+                    api_payload["projects"] = clean_projects
                 
+                # Payment Terms & Inco Terms defaults (from user example)
+                if not api_payload.get("payment_terms"): api_payload["payment_terms"] = "189" 
+                if not api_payload.get("inco_terms"): api_payload["inco_terms"] = "13"
+
                 # 3. CLEAN LINE ITEMS
                 clean_items = []
                 header_del_date = current_payload.get("delivery_date")
+                
+                total_sum = 0.0
                 
                 for item in api_payload.get("line_items", []):
                     # Ensure numeric types
@@ -192,15 +218,20 @@ class POAgent:
                     except: mat_grp = 1
                     try: u_id = int(item.get("unit_id", 1))
                     except: u_id = 1
-                    try: tax_c = int(item.get("tax_code", 119))
-                    except: tax_c = 119
+                    try: tax_c = int(item.get("tax_code", 118)) # User example defaulted to 118
+                    except: tax_c = 118
                     try: m_id = int(item.get("material_id"))
-                    except: m_id = 0 # Should be caught by validation, but safe fallback
+                    except: m_id = 0
+                    
+                    qty = float(item.get("quantity", 0))
+                    price = float(item.get("price", 0))
+                    item_total = qty * price
+                    total_sum += item_total
 
                     clean_item = {
                         "material_id": m_id,
-                        "quantity": item.get("quantity"),
-                        "price": item.get("price"),
+                        "quantity": str(qty).rstrip("0").rstrip(".") if qty.is_integer() else str(qty),
+                        "price": str(price).rstrip("0").rstrip(".") if price.is_integer() else str(price),
                         "short_text": str(item.get("short_text", "") or "Item"),
                         "material_group_id": mat_grp,
                         "unit_id": u_id,
@@ -208,20 +239,18 @@ class POAgent:
                         "control_code": "",
                         "subServices": "",
                         "short_desc": str(item.get("short_text", "") or "Item"),
-                        "sub_total": str(float(item.get("quantity", 0)) * float(item.get("price", 0))),
-                        "tax": "0"
+                        "sub_total": f"{item_total:.2f}",
+                        "tax": str(item.get("tax", "5")), # Defaulting to 5 as per example
+                        "delivery_date": format_date_api(item.get("delivery_date") or header_del_date)
                     }
-                    
-                    # Delivery date: Propagate from header if missing in item
-                    d_date = item.get("delivery_date") or header_del_date
-                    if d_date:
-                        clean_item["delivery_date"] = d_date
-                         
                     clean_items.append(clean_item)
                 
                 api_payload["line_items"] = clean_items
                 
-                print(f"DEBUG: Submitting PO: {json.dumps(api_payload)}")
+                # 2.1 Final Total Calculation
+                api_payload["total"] = f"{total_sum:.2f}"
+                
+                print(f"DEBUG: Submitting PO: {json.dumps(api_payload, indent=2)}")
                 result = self.api.create_po(api_payload)
                 
                 if result.get("success") or result.get("po_number"):
